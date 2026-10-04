@@ -46,6 +46,7 @@ pub mod pg_init_producer;
 pub mod pg_txn;
 pub mod policy_compact_delete;
 pub mod produce;
+pub mod produce_acks_zero;
 pub mod produce_fetch;
 pub mod sasl_scram_enforcement;
 pub mod storage_describe_cluster;
