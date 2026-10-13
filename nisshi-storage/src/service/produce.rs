@@ -14,6 +14,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use futures::future::join_all;
 use nisshi_sans_io::{
     ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
     TimestampType,
@@ -276,13 +277,21 @@ where
         transaction_id: Option<&str>,
         topic: TopicProduceData,
     ) -> TopicProduceResponse {
-        let mut partitions = vec![];
-
-        if let Some(partition_data) = topic.partition_data {
-            for partition in partition_data {
-                partitions.push(self.partition(transaction_id, &topic.name, partition).await)
-            }
-        }
+        // kr: P3 (ADR-002 D9). The partitions of a request are produced
+        // concurrently, as Kafka appends them all before waiting in
+        // purgatory: with an engine that acknowledges after a replicated
+        // commit, the commits overlap instead of adding up. A partition
+        // appears once per request, and its batches stay sequential, so the
+        // order within a partition is unchanged; responses keep the order of
+        // the request.
+        let partitions = join_all(
+            topic
+                .partition_data
+                .unwrap_or_default()
+                .into_iter()
+                .map(|partition| self.partition(transaction_id, &topic.name, partition)),
+        )
+        .await;
 
         TopicProduceResponse::default()
             .name(topic.name)
@@ -302,22 +311,17 @@ where
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
         let input = input.into();
 
-        let mut responses = Vec::with_capacity(
+        let transaction_id = input.request.transactional_id.as_deref();
+
+        let responses = join_all(
             input
                 .request
                 .topic_data
-                .as_ref()
-                .map_or(0, |topic_data| topic_data.len()),
-        );
-
-        if let Some(topics) = input.request.topic_data {
-            for topic in topics {
-                responses.push(
-                    self.topic(input.request.transactional_id.as_deref(), topic)
-                        .await,
-                )
-            }
-        }
+                .unwrap_or_default()
+                .into_iter()
+                .map(|topic| self.topic(transaction_id, topic)),
+        )
+        .await;
 
         Ok(ProduceResponse::default()
             .responses(Some(responses))
