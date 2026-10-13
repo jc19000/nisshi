@@ -1406,6 +1406,26 @@ pub trait Storage: Debug + Send + Sync + 'static {
         max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>>;
 
+    /// Wait until one of `waits` (a topic partition and the offset a Fetch
+    /// asked for) may have data at or beyond its offset, or until `timeout`.
+    /// Called by [`FetchService`] between two rounds of non-blocking
+    /// [`Storage::fetch`] calls that returned less than `min_bytes`.
+    ///
+    /// Returning early is always safe: the caller fetches again. An engine
+    /// that knows when a partition advances overrides this to wake a waiting
+    /// Fetch as soon as data arrives; the default polls, sleeping half of the
+    /// remaining time.
+    // kr: P2 (ADR-002 D10)
+    async fn wait_for_data(
+        &self,
+        _isolation: IsolationLevel,
+        _waits: &[(Topition, i64)],
+        timeout: Duration,
+    ) -> Result<()> {
+        tokio::time::sleep(timeout / 2).await;
+        Ok(())
+    }
+
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
@@ -1630,6 +1650,15 @@ where
         self.as_ref()
             .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
             .await
+    }
+
+    async fn wait_for_data(
+        &self,
+        isolation: IsolationLevel,
+        waits: &[(Topition, i64)],
+        timeout: Duration,
+    ) -> Result<()> {
+        self.as_ref().wait_for_data(isolation, waits, timeout).await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -1900,6 +1929,15 @@ where
         self.as_ref()
             .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
             .await
+    }
+
+    async fn wait_for_data(
+        &self,
+        isolation: IsolationLevel,
+        waits: &[(Topition, i64)],
+        timeout: Duration,
+    ) -> Result<()> {
+        self.as_ref().wait_for_data(isolation, waits, timeout).await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

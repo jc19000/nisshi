@@ -24,7 +24,7 @@ use nisshi_sans_io::{
     record::deflated::{Batch, Frame},
 };
 use rama::Service;
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
@@ -266,6 +266,7 @@ where
         isolation: IsolationLevel,
         fetch: &FetchTopic,
         is_first_non_empty: &mut bool,
+        waits: &mut Vec<(Topition, i64)>,
     ) -> Result<FetchableTopicResponse> {
         let started_at = Instant::now();
 
@@ -288,6 +289,11 @@ where
 
                 let mut partition_bytes = partition_max_bytes;
                 debug!(partition_bytes, is_first_non_empty);
+
+                waits.push((
+                    Topition::new(name, fetch_partition.partition),
+                    fetch_partition.fetch_offset,
+                ));
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
@@ -341,14 +347,19 @@ where
         } else {
             let started_at = SystemTime::now();
             let mut responses = vec![];
+            let mut waits = vec![];
             let mut iteration = 0;
-            let mut bytes = 0;
             let mut is_first_non_empty = true;
 
-            while !max_wait.saturating_sub(started_at.elapsed()?).is_zero() && bytes <= min_bytes {
-                debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()?));
+            // kr: P2 (ADR-002 D10). Rounds of non-blocking storage fetches;
+            // between two rounds the storage itself waits for data, so an
+            // engine that knows when a partition advances answers as soon as
+            // a record arrives instead of at the next poll.
+            loop {
+                debug!(?iteration, remaining = ?max_wait.saturating_sub(started_at.elapsed()?));
 
                 responses.clear();
+                waits.clear();
 
                 let fetch_started_at = SystemTime::now();
                 for fetch in topics.iter() {
@@ -360,35 +371,40 @@ where
                             isolation,
                             fetch,
                             &mut is_first_non_empty,
+                            &mut waits,
                         )
                         .await?;
 
                     responses.push(fetch_response);
                 }
 
-                bytes += u32::try_from(responses.byte_size())?;
+                // the record bytes of this round only: every earlier round
+                // came back short and was discarded
+                let bytes = u32::try_from(responses.byte_size())?;
 
                 let remaining = max_wait.saturating_sub(started_at.elapsed()?);
 
                 debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
 
-                if bytes > min_bytes {
+                // a partition in error is reported at once, as Kafka does
+                let failed = responses
+                    .iter()
+                    .flat_map(|topic| topic.partitions.iter().flatten())
+                    .any(|partition| partition.error_code != i16::from(ErrorCode::None));
+
+                if bytes >= min_bytes || failed || remaining.is_zero() {
                     break;
                 }
 
-                {
-                    let fetch_elapsed = fetch_started_at.elapsed()?;
-
-                    // we have some data to return to the client,
-                    // we haven't met the minimum size requirement,
-                    // but we don't have enough (estimated) time remaining to do another round
-                    if !responses.is_empty() && remaining < fetch_elapsed {
-                        debug!(responses.len = responses.len(), ?remaining, ?fetch_elapsed);
-                        break;
-                    }
+                // not enough (estimated) time remaining to do another round
+                if remaining < fetch_started_at.elapsed()? {
+                    debug!(responses.len = responses.len(), ?remaining);
+                    break;
                 }
 
-                sleep(remaining / 2).await;
+                self.storage
+                    .wait_for_data(isolation, &waits, remaining)
+                    .await?;
 
                 iteration += 1;
             }
