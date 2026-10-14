@@ -14,7 +14,8 @@
 
 use nisshi_sans_io::{
     ApiKey as _, ApiVersionsRequest, ErrorCode, Frame, FrameInput, Header, MetadataRequest,
-    MetadataResponse, RequestInput, metadata_response::MetadataResponseBroker,
+    MetadataResponse, RequestInput, metadata_request::MetadataRequestTopic,
+    metadata_response::MetadataResponseBroker,
 };
 use nisshi_service::{
     BytesFrameLayer, BytesLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer,
@@ -205,6 +206,91 @@ async fn simple_routes() -> Result<(), Error> {
         })
         .await?;
     assert_eq!(Some(cluster_id.into()), response.cluster_id);
+
+    Ok(())
+}
+
+/// kr: P11. A request and a response above the size served on the connection
+/// task take the blocking pool; both paths give the same frames.
+#[tokio::test]
+async fn frames_on_either_side_of_the_inline_limit() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let service = (
+        RequestFrameLayer,
+        FrameBytesLayer,
+        BytesLayer,
+        BytesFrameLayer::default(),
+    )
+        .into_layer(
+            FrameRouteService::builder()
+                .with_service(RequestLayer::<MetadataRequest>::new().into_layer(
+                    ResponseService::new(|req: RequestInput<MetadataRequest>| {
+                        // one broker per topic asked for, named after it
+                        let brokers = req
+                            .request
+                            .topics
+                            .unwrap_or_default()
+                            .into_iter()
+                            .zip(0..)
+                            .map(|(topic, node_id)| {
+                                MetadataResponseBroker::default()
+                                    .node_id(node_id)
+                                    .host(topic.name.unwrap_or_default())
+                                    .port(9092)
+                                    .rack(None)
+                            })
+                            .collect();
+
+                        Ok::<_, Error>(
+                            MetadataResponse::default()
+                                .brokers(Some(brokers))
+                                .topics(Some([].into()))
+                                .cluster_id(Some("abc".into()))
+                                .controller_id(Some(111))
+                                .throttle_time_ms(Some(0))
+                                .cluster_authorized_operations(Some(-1)),
+                        )
+                    }),
+                ))
+                .and_then(|builder| builder.build())?,
+        );
+
+    // 3 names fit in a frame served inline; 3000 names of 64 bytes do not
+    for count in [3, 3_000] {
+        let names = (0..count).map(|i| format!("{i:064}")).collect::<Vec<_>>();
+
+        let request = MetadataRequest::default()
+            .topics(Some(
+                names
+                    .iter()
+                    .map(|name| {
+                        MetadataRequestTopic::default()
+                            .topic_id(Some([0; 16]))
+                            .name(Some(name.clone()))
+                    })
+                    .collect(),
+            ))
+            .allow_auto_topic_creation(Some(false))
+            .include_cluster_authorized_operations(Some(false))
+            .include_topic_authorized_operations(Some(false));
+
+        let response = service
+            .serve(RequestInput {
+                request,
+                extensions: Extensions::default(),
+            })
+            .await?;
+
+        let hosts = response
+            .brokers
+            .unwrap_or_default()
+            .into_iter()
+            .map(|broker| broker.host)
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, hosts);
+    }
 
     Ok(())
 }

@@ -21,9 +21,9 @@ use std::{
 use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::{
-    ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header, Request,
-    RequestInput, Response, RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest,
+    ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header,
+    MaximumAllocationSize as _, Request, RequestInput, Response, RootMessageMeta,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
 };
 use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
@@ -35,6 +35,14 @@ use crate::{
     API_ERRORS, API_REQUESTS, ProgressBarExtension,
     probe::{self, Stage},
 };
+
+/// kr: P11. A frame up to this size is decoded, and a response up to this size
+/// encoded, on the connection task itself. The round trip through the blocking
+/// pool costs two thread wake-ups, far more than the codec of a small frame,
+/// and a connection serves one request at a time: that cost is paid in full by
+/// every request queued behind. Larger frames keep the blocking pool, so a
+/// worker thread is never held by a long encoding.
+const INLINE_FRAME_BYTES: usize = 64 * 1024;
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -317,9 +325,12 @@ where
         } else {
             let decoding = probe::now();
             let key = probe::api_key_of(&req.bytes);
-            let frame = spawn_blocking(|| Frame::request_from_bytes(req.bytes))
-                .await?
-                .inspect(|request| debug!(?request))?;
+            let frame = if req.bytes.len() <= INLINE_FRAME_BYTES {
+                Frame::request_from_bytes(req.bytes)
+            } else {
+                spawn_blocking(|| Frame::request_from_bytes(req.bytes)).await?
+            }
+            .inspect(|request| debug!(?request))?;
             probe::record(key, Stage::Decode, decoding.elapsed());
             frame
         };
@@ -363,6 +374,9 @@ where
                 .inspect(|response| debug!(?response))?
         };
         probe::record(api_key, Stage::Handle, handling.elapsed());
+        let inline = body
+            .maximum_allocation_size()
+            .is_ok_and(|size| size <= INLINE_FRAME_BYTES);
 
         if sasl_handshake_v0 {
             //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
@@ -404,15 +418,19 @@ where
             }
 
             let encoding = probe::now();
-            spawn_blocking(move || {
+            let encode = move || {
                 Frame::response(
                     Header::Response { correlation_id },
                     body,
                     api_key,
                     api_version,
                 )
-            })
-            .await?
+            };
+            if inline {
+                encode()
+            } else {
+                spawn_blocking(encode).await?
+            }
             .inspect(|_| probe::record(api_key, Stage::Encode, encoding.elapsed()))
             .inspect(|response| {
                 debug!(response = ?response[..]);
