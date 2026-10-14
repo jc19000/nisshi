@@ -290,11 +290,6 @@ where
                 let mut partition_bytes = partition_max_bytes;
                 debug!(partition_bytes, is_first_non_empty);
 
-                waits.push((
-                    Topition::new(name, fetch_partition.partition),
-                    fetch_partition.fetch_offset,
-                ));
-
                 let remaining = max_wait.saturating_sub(started_at.elapsed());
 
                 let partition = self
@@ -307,6 +302,25 @@ where
                         fetch_partition,
                     )
                     .await?;
+
+                // kr: P2. A round short of min_bytes is discarded and the
+                // storage waits for more: beyond what this round returned,
+                // or the wait would return at once and the handler spin
+                // until max_wait.
+                waits.push((
+                    Topition::new(name, fetch_partition.partition),
+                    partition
+                        .records
+                        .as_ref()
+                        .and_then(|records| {
+                            records
+                                .batches
+                                .iter()
+                                .map(|batch| batch.max_offset() + 1)
+                                .max()
+                        })
+                        .unwrap_or(fetch_partition.fetch_offset),
+                ));
 
                 *is_first_non_empty = *is_first_non_empty
                     && partition
