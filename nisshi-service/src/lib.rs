@@ -254,6 +254,7 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+pub mod probe;
 mod stream;
 
 pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};

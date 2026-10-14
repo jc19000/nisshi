@@ -31,7 +31,10 @@ use rsasl::config::SASLConfig;
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
 
-use crate::{API_ERRORS, API_REQUESTS, ProgressBarExtension};
+use crate::{
+    API_ERRORS, API_REQUESTS, ProgressBarExtension,
+    probe::{self, Stage},
+};
 
 /// A [Matcher] of [`Request`]s using their [API key][`ApiKey`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -312,9 +315,13 @@ where
                 ),
             }
         } else {
-            spawn_blocking(|| Frame::request_from_bytes(req.bytes))
+            let decoding = probe::now();
+            let key = probe::api_key_of(&req.bytes);
+            let frame = spawn_blocking(|| Frame::request_from_bytes(req.bytes))
                 .await?
-                .inspect(|request| debug!(?request))?
+                .inspect(|request| debug!(?request))?;
+            probe::record(key, Stage::Decode, decoding.elapsed());
+            frame
         };
 
         let api_key = req.api_key()?;
@@ -345,6 +352,7 @@ where
             _ = extensions.insert(authentication);
         }
 
+        let handling = probe::now();
         let Frame { body, .. } = {
             self.inner
                 .serve(FrameInput {
@@ -354,6 +362,7 @@ where
                 .await
                 .inspect(|response| debug!(?response))?
         };
+        probe::record(api_key, Stage::Handle, handling.elapsed());
 
         if sasl_handshake_v0 {
             //  If SaslHandshakeRequest version is v0, a series of SASL client and server tokens
@@ -394,6 +403,7 @@ where
                 *v0 = Some(true)
             }
 
+            let encoding = probe::now();
             spawn_blocking(move || {
                 Frame::response(
                     Header::Response { correlation_id },
@@ -403,6 +413,7 @@ where
                 )
             })
             .await?
+            .inspect(|_| probe::record(api_key, Stage::Encode, encoding.elapsed()))
             .inspect(|response| {
                 debug!(response = ?response[..]);
                 API_REQUESTS.add(1, &attributes);

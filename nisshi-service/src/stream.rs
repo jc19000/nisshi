@@ -43,6 +43,7 @@ use tracing::{Instrument as _, Level, debug, error, instrument, span};
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
     TcpListenerInput, frame_length, frame_size,
+    probe::{self, Stage},
 };
 
 /// The largest request payload a listener accepts unless [`TcpContext::maximum_frame_size`]
@@ -866,12 +867,21 @@ where
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin + ExtensionsRef,
     {
+        // kr: P10. Stage timings of the connection loop.
+        let started = probe::now();
         let size = self.wait(req, limits).await?;
+        let waited = probe::now();
         let request = self.read(req, size, limits).await?;
+        let api_key = probe::api_key_of(&request);
+        probe::record(api_key, Stage::Idle, waited.duration_since(started));
+        probe::record(api_key, Stage::Read, waited.elapsed());
         let response = self
             .process(attributes, request, req.extensions().clone())
             .await?;
-        self.write(req, response, limits).await
+        let processed = probe::now();
+        self.write(req, response, limits).await?;
+        probe::record(api_key, Stage::Write, processed.elapsed());
+        Ok(())
     }
 }
 
