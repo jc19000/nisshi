@@ -16,8 +16,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
 use nisshi_sans_io::{
-    ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, RequestInput,
-    TimestampType,
+    ApiKey, BatchAttribute, ErrorCode, ProduceAdmission, ProduceRequest, ProduceResponse,
+    RequestInput, TimestampType,
     produce_request::{PartitionProduceData, TopicProduceData},
     produce_response::{PartitionProduceResponse, TopicProduceResponse},
     record::deflated,
@@ -25,7 +25,7 @@ use nisshi_sans_io::{
 use rama::Service;
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, ProduceCompletion, Result, Storage, Topition};
 
 /// Why a client batch must be rejected with `INVALID_RECORD` before anything
 /// is written, or `None` if it may be stored. Kafka's `LogValidator` rejects
@@ -297,6 +297,229 @@ where
             .name(topic.name)
             .partition_responses(Some(partitions))
     }
+
+    /// kr: P12 (ADR-007 D2). Stage 1 of one partition of the request: the same checks as
+    /// [`Self::partition`], then its batches handed to [`Storage::produce_staged`] one after
+    /// the other. The first refusal stops the partition: later batches are not staged.
+    async fn partition_staged(
+        &self,
+        transaction_id: Option<&str>,
+        name: &str,
+        partition: PartitionProduceData,
+    ) -> StagedPartition {
+        let index = partition.index;
+        let staged = |early| StagedPartition {
+            index,
+            completions: Vec::new(),
+            refused: None,
+            early: Some(early),
+        };
+
+        let Some(records) = partition.records else {
+            return staged(self.error(index, ErrorCode::UnknownServerError));
+        };
+
+        if let Some((rejected, reason)) = records
+            .batches
+            .iter()
+            .find_map(|batch| rejection(batch).map(|reason| (batch, reason)))
+        {
+            warn!(
+                topic = name,
+                partition = index,
+                record_count = rejected.record_count,
+                last_offset_delta = rejected.last_offset_delta,
+                reason,
+                "rejecting produce batch",
+            );
+
+            return staged(
+                self.error(index, ErrorCode::InvalidRecord)
+                    .error_message(Some(reason.into())),
+            );
+        }
+
+        let mut out = StagedPartition {
+            index,
+            completions: Vec::with_capacity(records.batches.len()),
+            refused: None,
+            early: None,
+        };
+
+        let tp = Topition::new(name, index);
+
+        for mut batch in records.batches {
+            // Set before stage 1: the batch is ordered with its final timestamps.
+            if BatchAttribute::try_from(batch.attributes)
+                .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
+                .unwrap_or_default()
+            {
+                let base_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or_default();
+
+                batch.base_timestamp = base_timestamp;
+                batch.max_timestamp = base_timestamp;
+            }
+
+            match self
+                .storage
+                .produce_staged(transaction_id, &tp, batch)
+                .await
+            {
+                Ok(completion) => out.completions.push(completion),
+
+                Err(Error::Api(error_code)) => {
+                    debug!(?self, ?error_code);
+                    out.refused = Some(error_code);
+                    break;
+                }
+
+                Err(otherwise) => {
+                    warn!(?otherwise);
+                    out.refused = Some(ErrorCode::UnknownServerError);
+                    break;
+                }
+            }
+        }
+
+        out
+    }
+
+    /// kr: P12 (ADR-007 D2). Stage 2 of one partition: the response [`Self::partition`]
+    /// would have built (base offset of the first batch, code of the first error).
+    async fn partition_completed(&self, staged: StagedPartition) -> PartitionProduceResponse {
+        if let Some(early) = staged.early {
+            return early;
+        }
+
+        let mut base_offset = None;
+
+        for completion in staged.completions {
+            match completion.await.inspect_err(|err| match err {
+                storage_api @ Error::Api(_) => {
+                    warn!(?storage_api)
+                }
+                otherwise => error!(?otherwise),
+            }) {
+                Ok(offset) => _ = base_offset.get_or_insert(offset),
+                Err(Error::Api(error_code)) => return self.error(staged.index, error_code),
+                Err(_) => return self.error(staged.index, ErrorCode::UnknownServerError),
+            }
+        }
+
+        match (staged.refused, base_offset) {
+            (Some(error_code), _) => self.error(staged.index, error_code),
+            (None, Some(base_offset)) => PartitionProduceResponse::default()
+                .index(staged.index)
+                .error_code(ErrorCode::None.into())
+                .base_offset(base_offset)
+                .log_append_time_ms(Some(-1))
+                .log_start_offset(Some(0))
+                .record_errors(Some([].into()))
+                .error_message(None)
+                .current_leader(None),
+            (None, None) => self.error(staged.index, ErrorCode::UnknownServerError),
+        }
+    }
+
+    /// kr: P12 (ADR-007 D2). The request in two stages, for a pipelining connection loop:
+    /// stage 1 of every partition (in parallel, P3; a partition present twice in the request
+    /// is staged in request order), then `admission`, then stage 2 of every partition.
+    async fn serve_staged(
+        &self,
+        transaction_id: Option<&str>,
+        topics: Vec<TopicProduceData>,
+        admission: &ProduceAdmission,
+    ) -> Vec<TopicProduceResponse> {
+        let mut names = Vec::with_capacity(topics.len());
+        let mut entries = Vec::new();
+
+        for (t, topic) in topics.into_iter().enumerate() {
+            for partition in topic.partition_data.unwrap_or_default() {
+                entries.push((t, partition));
+            }
+            names.push(topic.name);
+        }
+
+        let total = entries.len();
+
+        // One chain per distinct topic partition, in order of first appearance.
+        type Chain = Vec<(usize, usize, PartitionProduceData)>;
+        let mut chains: Vec<(String, i32, Chain)> = Vec::new();
+        for (i, (t, partition)) in entries.into_iter().enumerate() {
+            let name = names.get(t).cloned().unwrap_or_default();
+            let index = partition.index;
+            match chains
+                .iter_mut()
+                .find(|(n, p, _)| *n == name && *p == index)
+            {
+                Some((_, _, chain)) => chain.push((i, t, partition)),
+                None => chains.push((name, index, vec![(i, t, partition)])),
+            }
+        }
+
+        let stage_one = join_all(chains.into_iter().map(|(name, _, chain)| async move {
+            let mut out = Vec::with_capacity(chain.len());
+            for (i, t, partition) in chain {
+                out.push((
+                    i,
+                    t,
+                    self.partition_staged(transaction_id, &name, partition)
+                        .await,
+                ));
+            }
+            out
+        }))
+        .await;
+
+        admission.admit();
+
+        let mut staged: Vec<Option<(usize, StagedPartition)>> = (0..total).map(|_| None).collect();
+        for (i, t, s) in stage_one.into_iter().flatten() {
+            if let Some(slot) = staged.get_mut(i) {
+                *slot = Some((t, s));
+            }
+        }
+
+        let completed = join_all(
+            staged
+                .into_iter()
+                .flatten()
+                .map(|(t, s)| async move { (t, self.partition_completed(s).await) }),
+        )
+        .await;
+
+        let mut responses: Vec<Vec<PartitionProduceResponse>> =
+            names.iter().map(|_| Vec::new()).collect();
+        for (t, response) in completed {
+            if let Some(partitions) = responses.get_mut(t) {
+                partitions.push(response);
+            }
+        }
+
+        names
+            .iter()
+            .zip(responses)
+            .map(|(name, partitions)| {
+                TopicProduceResponse::default()
+                    .name(name.clone())
+                    .partition_responses(Some(partitions))
+            })
+            .collect()
+    }
+}
+
+/// kr: P12. Stage 1 of one partition entry of a Produce request.
+struct StagedPartition {
+    index: i32,
+    /// Batches ordered by the engine, in request order.
+    completions: Vec<ProduceCompletion>,
+    /// Refusal of the first batch not staged.
+    refused: Option<ErrorCode>,
+    /// Response decided before any batch was staged.
+    early: Option<PartitionProduceResponse>,
 }
 
 impl<G, I> Service<I> for ProduceService<G>
@@ -309,13 +532,32 @@ where
 
     #[instrument(skip(self, input))]
     async fn serve(&self, input: I) -> Result<Self::Output, Self::Error> {
-        let input = input.into();
+        let RequestInput {
+            request,
+            extensions,
+        } = input.into();
 
-        let transaction_id = input.request.transactional_id.as_deref();
+        let transaction_id = request.transactional_id.as_deref();
+
+        // kr: P12 (ADR-007 D2). Two stages only for a pipelining connection loop; without
+        // the extension, the P3 path below, unchanged.
+        if let Some(admission) = extensions.get_ref::<ProduceAdmission>() {
+            let responses = self
+                .serve_staged(
+                    transaction_id,
+                    request.topic_data.unwrap_or_default(),
+                    admission,
+                )
+                .await;
+
+            return Ok(ProduceResponse::default()
+                .responses(Some(responses))
+                .throttle_time_ms(Some(0))
+                .node_endpoints(None));
+        }
 
         let responses = join_all(
-            input
-                .request
+            request
                 .topic_data
                 .unwrap_or_default()
                 .into_iter()
@@ -327,6 +569,164 @@ where
             .responses(Some(responses))
             .throttle_time_ms(Some(0))
             .node_endpoints(None))
+    }
+}
+
+/// kr: P12 (ADR-007 D2, I-P10). On an engine with the default `produce_staged` (stage 1 =
+/// the whole produce), here a channel-backed fake that numbers batches in arrival order.
+#[cfg(test)]
+mod kr_p12_tests {
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use bytes::Bytes;
+    use nisshi_sans_io::record::{Record, deflated::Frame, inflated};
+    use rama::extensions::Extensions;
+
+    use super::*;
+    use crate::{Request, RequestChannelService, bounded_channel, service::Response};
+
+    /// A storage whose produce gives `next` offsets per topic partition, in arrival order.
+    fn storage() -> RequestChannelService {
+        let (tx, mut rx) = bounded_channel(16);
+        drop(tokio::spawn(async move {
+            let mut next: BTreeMap<Topition, i64> = BTreeMap::new();
+            while let Some((request, reply)) = rx.recv().await {
+                if let Request::Produce {
+                    topition, batch, ..
+                } = request
+                {
+                    let at = next.entry(topition).or_default();
+                    let offset = *at;
+                    *at += i64::from(batch.last_offset_delta) + 1;
+                    _ = reply.send(Response::Produce(Ok(offset)));
+                }
+            }
+        }));
+        RequestChannelService::new(tx)
+    }
+
+    fn batch(value: &'static [u8], records: usize) -> Result<deflated::Batch> {
+        let mut b = inflated::Batch::builder().last_offset_delta(records as i32 - 1);
+        for i in 0..records {
+            b = b.record(
+                Record::builder()
+                    .offset_delta(i as i32)
+                    .value(Bytes::from_static(value).into()),
+            );
+        }
+        b.build().and_then(TryInto::try_into).map_err(Into::into)
+    }
+
+    fn partition(index: i32, batches: Vec<deflated::Batch>) -> PartitionProduceData {
+        PartitionProduceData::default()
+            .index(index)
+            .records(Some(Frame { batches }))
+    }
+
+    fn topic(name: &str, partitions: Vec<PartitionProduceData>) -> TopicProduceData {
+        TopicProduceData::default()
+            .name(name.into())
+            .partition_data(Some(partitions))
+    }
+
+    fn admission() -> (Extensions, Arc<AtomicUsize>) {
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let extensions = Extensions::default();
+        _ = extensions.insert(ProduceAdmission::new({
+            let admitted = Arc::clone(&admitted);
+            move || {
+                _ = admitted.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+        (extensions, admitted)
+    }
+
+    /// Two topics, several batches per partition, an empty partition and a refused batch.
+    fn request() -> Result<ProduceRequest> {
+        let mut control = batch(b"c", 1)?;
+        control.attributes |= 1 << 5;
+        Ok(ProduceRequest::default().topic_data(Some(vec![
+            topic(
+                "a",
+                vec![
+                    partition(0, vec![batch(b"x", 2)?, batch(b"y", 3)?]),
+                    partition(1, vec![batch(b"z", 1)?]),
+                    PartitionProduceData::default().index(2),
+                ],
+            ),
+            topic(
+                "b",
+                vec![
+                    partition(0, vec![control]),
+                    partition(1, vec![batch(b"v", 4)?]),
+                ],
+            ),
+        ])))
+    }
+
+    #[tokio::test]
+    async fn staged_path_answers_like_p3_and_admits_once() -> Result<()> {
+        let upstream = ProduceService { storage: storage() }
+            .serve(request()?)
+            .await?;
+
+        let (extensions, admitted) = admission();
+        let staged = ProduceService { storage: storage() }
+            .serve(RequestInput {
+                request: request()?,
+                extensions,
+            })
+            .await?;
+
+        assert_eq!(1, admitted.load(Ordering::SeqCst));
+        assert_eq!(upstream, staged);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_partition_present_twice_is_staged_in_request_order() -> Result<()> {
+        let (extensions, admitted) = admission();
+        let request = ProduceRequest::default().topic_data(Some(vec![
+            topic(
+                "a",
+                vec![
+                    partition(0, vec![batch(b"x", 2)?, batch(b"y", 3)?]),
+                    partition(1, vec![batch(b"z", 1)?]),
+                    partition(0, vec![batch(b"w", 4)?]),
+                ],
+            ),
+            topic("a", vec![partition(0, vec![batch(b"v", 1)?])]),
+        ]));
+        let response = ProduceService { storage: storage() }
+            .serve(RequestInput {
+                request,
+                extensions,
+            })
+            .await?;
+        assert_eq!(1, admitted.load(Ordering::SeqCst));
+        let offsets = response
+            .responses
+            .iter()
+            .flatten()
+            .map(|t| {
+                t.partition_responses
+                    .iter()
+                    .flatten()
+                    .map(|p| (p.index, p.base_offset, p.error_code))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vec![vec![(0, 0, 0), (1, 0, 0), (0, 5, 0)], vec![(0, 9, 0)]],
+            offsets
+        );
+        Ok(())
     }
 }
 

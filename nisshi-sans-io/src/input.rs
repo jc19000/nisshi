@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use rama::{
     ServiceInput,
-    extensions::{Extensions, ExtensionsRef},
+    extensions::{Extension, Extensions, ExtensionsRef},
 };
 
 use crate::{Body, Frame, Request};
@@ -152,5 +154,28 @@ impl From<ServiceInput<Bytes>> for BytesInput {
             bytes: value.input,
             extensions: value.extensions,
         }
+    }
+}
+
+/// kr: P12 (ADR-007). Put by a pipelining connection loop into the extensions of a Produce
+/// request. The handler calls [`ProduceAdmission::admit`] once every batch of the request
+/// has a stage-1 verdict (ordered by the storage engine, or refused); the loop may then read
+/// the next request. Idempotent; never called = admission at completion.
+#[derive(Clone, Extension)]
+pub struct ProduceAdmission(Arc<dyn Fn() + Send + Sync>);
+
+impl ProduceAdmission {
+    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(f))
+    }
+
+    pub fn admit(&self) {
+        (self.0)()
+    }
+}
+
+impl std::fmt::Debug for ProduceAdmission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(ProduceAdmission)).finish()
     }
 }

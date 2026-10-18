@@ -1352,6 +1352,11 @@ pub type ArcDynStorageFactory = Arc<DynStorageFactory>;
 // trait is "object-safe" or not.
 fn _assert_storage_factory_trait_object(_s: &dyn StorageFactory) {}
 
+/// Second stage of a two-stage produce ([`Storage::produce_staged`]): resolves to what
+/// [`Storage::produce`] would have returned.
+// kr: P12 (ADR-007)
+pub type ProduceCompletion = std::pin::Pin<Box<dyn Future<Output = Result<i64>> + Send + 'static>>;
+
 /// Storage
 ///
 /// The Core storage abstraction. All storage engines implement this type.
@@ -1394,6 +1399,24 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topition: &Topition,
         batch: deflated::Batch,
     ) -> Result<i64>;
+
+    /// Two-stage produce. Returns once the engine has ORDERED the batch (its place in the
+    /// partition is fixed: no later `produce_staged` of the same partition, started after
+    /// this call returned, can get a lower offset) or refused it (`Err`). The returned future
+    /// then resolves to the batch's outcome; `Ok(completion)` is never an acknowledgement by
+    /// itself. Dropping the completion does not cancel the write (it may still be committed).
+    /// The default runs `produce` to completion: stage 1 is the whole produce (upstream
+    /// behavior).
+    // kr: P12 (ADR-007)
+    async fn produce_staged(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<ProduceCompletion> {
+        let offset = self.produce(transaction_id, topition, batch).await?;
+        Ok(Box::pin(std::future::ready(Ok(offset))))
+    }
 
     /// Fetch deflated batches from storage.
     async fn fetch(
@@ -1636,6 +1659,17 @@ where
         batch: deflated::Batch,
     ) -> Result<i64> {
         self.as_ref().produce(transaction_id, topition, batch).await
+    }
+
+    async fn produce_staged(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<ProduceCompletion> {
+        self.as_ref()
+            .produce_staged(transaction_id, topition, batch)
+            .await
     }
 
     async fn fetch(
@@ -1915,6 +1949,17 @@ where
         batch: deflated::Batch,
     ) -> Result<i64> {
         self.as_ref().produce(transaction_id, topition, batch).await
+    }
+
+    async fn produce_staged(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<ProduceCompletion> {
+        self.as_ref()
+            .produce_staged(transaction_id, topition, batch)
+            .await
     }
 
     async fn fetch(
