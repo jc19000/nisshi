@@ -113,6 +113,16 @@ pub(super) struct Arg {
     /// Silent
     #[arg(long)]
     silent: bool,
+
+    /// Produce requests a connection serves at once (1 to 5); 1 serves one request at a
+    /// time, like Apache Kafka
+    #[arg(
+        long,
+        env = "NISSHI_PRODUCE_PIPELINE_DEPTH",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u8).range(1..=5)
+    )]
+    produce_pipeline_depth: u8,
 }
 
 fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -492,7 +502,11 @@ impl Arg {
             }
         }
 
-        broker.build().await.map_err(Into::into)
+        broker
+            .build()
+            .await
+            .map(|broker| broker.produce_pipeline_depth(usize::from(self.produce_pipeline_depth)))
+            .map_err(Into::into)
     }
 }
 

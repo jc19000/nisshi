@@ -42,7 +42,7 @@ use tracing::{Instrument as _, Level, debug, error, instrument, span};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
-    TcpListenerInput, frame_length, frame_size,
+    TcpListenerInput, frame_length, frame_size, pipeline,
     probe::{self, Stage},
 };
 
@@ -143,7 +143,7 @@ where
 
 /// Reads exactly `buf.len()` bytes, chunk by chunk, resetting `idle_timeout`
 /// after every chunk of forward progress.
-async fn read_exact_with_idle_timeout<R>(
+pub(crate) async fn read_exact_with_idle_timeout<R>(
     req: &mut R,
     buf: &mut [u8],
     idle_timeout: Option<Duration>,
@@ -359,6 +359,7 @@ pub struct TcpContext {
     maximum_frame_size: Option<usize>,
     connection_idle_timeout: Option<Duration>,
     io_idle_timeout: Option<Duration>,
+    produce_pipeline_depth: Option<usize>,
 }
 
 impl Default for TcpContext {
@@ -368,6 +369,7 @@ impl Default for TcpContext {
             maximum_frame_size: Some(DEFAULT_MAXIMUM_FRAME_SIZE),
             connection_idle_timeout: Some(DEFAULT_CONNECTION_IDLE_TIMEOUT),
             io_idle_timeout: Some(DEFAULT_IO_IDLE_TIMEOUT),
+            produce_pipeline_depth: None,
         }
     }
 }
@@ -402,6 +404,11 @@ struct ConnectionIdleTimeoutExtension(Duration);
 #[derive(Clone, Debug, Extension)]
 struct IoIdleTimeoutExtension(Duration);
 
+/// kr: P13 (ADR-007 D3). Per-connection [`TcpContext::produce_pipeline_depth`], carried on
+/// the stream's [`Extensions`]. Absent means 1: the upstream loop.
+#[derive(Clone, Debug, Extension)]
+pub(crate) struct ProducePipelineDepthExtension(pub(crate) usize);
+
 impl TcpContext {
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
@@ -432,6 +439,15 @@ impl TcpContext {
     pub fn io_idle_timeout(self, io_idle_timeout: Option<Duration>) -> Self {
         Self {
             io_idle_timeout,
+            ..self
+        }
+    }
+
+    /// kr: P13 (ADR-007 D3). Produce requests a connection serves at once, within
+    /// `[1, 5]`; `None` or 1 keeps the upstream loop, one request at a time.
+    pub fn produce_pipeline_depth(self, produce_pipeline_depth: Option<usize>) -> Self {
+        Self {
+            produce_pipeline_depth,
             ..self
         }
     }
@@ -602,6 +618,12 @@ where
                 .insert(IoIdleTimeoutExtension(io_idle_timeout));
         }
 
+        if let Some(depth) = self.state.produce_pipeline_depth {
+            _ = req
+                .extensions()
+                .insert(ProducePipelineDepthExtension(depth));
+        }
+
         self.inner.serve(req).await
     }
 }
@@ -688,15 +710,21 @@ impl<S> TcpBytesService<S> {
 /// `None` in any field means that limit is disabled, either because the
 /// [`TcpContext`] said so or because no [`TcpContextLayer`] set one.
 #[derive(Clone, Copy, Debug, Default)]
-struct ConnectionLimits {
-    maximum_frame_size: Option<usize>,
-    connection_idle_timeout: Option<Duration>,
-    io_idle_timeout: Option<Duration>,
+pub(crate) struct ConnectionLimits {
+    pub(crate) maximum_frame_size: Option<usize>,
+    pub(crate) connection_idle_timeout: Option<Duration>,
+    pub(crate) io_idle_timeout: Option<Duration>,
+    /// kr: P13. Within `[1, MAX_PRODUCE_PIPELINE_DEPTH]` once read from the extensions.
+    pub(crate) produce_pipeline_depth: usize,
 }
 
 impl ConnectionLimits {
     fn from_extensions(extensions: &Extensions) -> Self {
         Self {
+            produce_pipeline_depth: extensions
+                .get_ref::<ProducePipelineDepthExtension>()
+                .map_or(1, |depth| depth.0)
+                .clamp(1, pipeline::MAX_PRODUCE_PIPELINE_DEPTH),
             maximum_frame_size: extensions
                 .get_ref::<MaximumFrameSizeExtension>()
                 .map(|maximum_frame_size| maximum_frame_size.0),
@@ -716,7 +744,11 @@ where
     S::Error: From<Error> + From<io::Error> + Debug,
 {
     #[instrument(skip_all)]
-    async fn wait<R>(&self, req: &mut R, limits: ConnectionLimits) -> Result<[u8; 4], S::Error>
+    pub(crate) async fn wait<R>(
+        &self,
+        req: &mut R,
+        limits: ConnectionLimits,
+    ) -> Result<[u8; 4], S::Error>
     where
         R: AsyncReadExt + Unpin,
     {
@@ -762,7 +794,7 @@ where
     /// connection-count limit is the complementary control for that, and is
     /// tracked separately.
     #[instrument(skip_all)]
-    async fn read<R>(
+    pub(crate) async fn read<R>(
         &self,
         req: &mut R,
         size: [u8; 4],
@@ -798,7 +830,7 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn process(
+    pub(crate) async fn process(
         &self,
         attributes: &[KeyValue],
         request: Bytes,
@@ -825,7 +857,7 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn write<W>(
+    pub(crate) async fn write<W>(
         &self,
         req: &mut W,
         frame: Bytes,
@@ -913,6 +945,11 @@ where
         };
 
         let limits = ConnectionLimits::from_extensions(req.extensions());
+
+        // kr: P13 (ADR-007 D3). Beyond 1, the Produce pipeline; at 1, the loop below.
+        if limits.produce_pipeline_depth > 1 {
+            return pipeline::serve(self, req, limits, &attributes[..]).await;
+        }
 
         loop {
             let attributes = attributes.clone();

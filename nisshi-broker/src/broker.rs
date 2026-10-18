@@ -95,6 +95,8 @@ pub struct Broker<G, S> {
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
+    /// kr: P13 (ADR-007 D3): Produce requests a connection serves at once, 1 = upstream.
+    produce_pipeline_depth: usize,
     maintenance_interval: Option<Duration>,
     transaction_maintenance_interval: Option<Duration>,
 
@@ -133,6 +135,7 @@ where
             tls_server_config: None,
 
             silent: false,
+            produce_pipeline_depth: 1,
 
             maintenance_interval: None,
             transaction_maintenance_interval: None,
@@ -145,6 +148,15 @@ where
 
     pub fn builder() -> PhantomBuilder {
         Builder::default()
+    }
+
+    /// kr: P13 (ADR-007 D3). Produce requests a connection serves at once, clamped to
+    /// `[1, 5]`; 1 (the default) is the upstream loop.
+    pub fn produce_pipeline_depth(self, produce_pipeline_depth: usize) -> Self {
+        Self {
+            produce_pipeline_depth: produce_pipeline_depth.clamp(1, 5),
+            ..self
+        }
     }
 
     pub async fn main(mut self, started: Instant) -> Result<ErrorCode> {
@@ -413,7 +425,8 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
-                        self.sasl_config.clone()
+                        self.sasl_config.clone(),
+                        self.produce_pipeline_depth,
                     )?;
 
                     let acceptor = acceptor.clone();
@@ -859,6 +872,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
+            produce_pipeline_depth: 1,
             maintenance_interval: self.maintenance_interval,
             transaction_maintenance_interval: self.transaction_maintenance_interval,
             cancellation: self.cancellation,

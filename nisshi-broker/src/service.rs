@@ -37,6 +37,7 @@ pub fn services<C, S>(
     coordinator: C,
     storage: S,
     sasl_config: Option<Arc<SASLConfig>>,
+    produce_pipeline_depth: usize,
 ) -> Result<TcpRouteFrame, Error>
 where
     S: Storage + Clone,
@@ -51,7 +52,12 @@ where
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
             (
-                TcpContextLayer::new(TcpContext::default().cluster_id(Some(cluster_id.into()))),
+                // kr: P13 (ADR-007 D3)
+                TcpContextLayer::new(
+                    TcpContext::default()
+                        .cluster_id(Some(cluster_id.into()))
+                        .produce_pipeline_depth(Some(produce_pipeline_depth)),
+                ),
                 TcpBytesLayer,
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
             )

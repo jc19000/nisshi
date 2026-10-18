@@ -254,6 +254,7 @@ mod channel;
 mod consumer;
 mod frame;
 mod input;
+mod pipeline;
 pub mod probe;
 mod stream;
 

@@ -44,15 +44,23 @@ pub enum Stage {
     Encode,
     /// Response bytes written and flushed.
     Write,
+    /// kr: P13. Pipelined Produce: whole frame read to its admission (every batch ordered
+    /// or refused by the engine), when the next request may be read.
+    Admit,
+    /// kr: P13. Response complete to the start of its write: the wait at the head of the
+    /// line, behind the responses of earlier requests.
+    Queue,
 }
 
-const STAGES: [(Stage, &str); 6] = [
+const STAGES: [(Stage, &str); 8] = [
     (Stage::Idle, "idle"),
     (Stage::Read, "read"),
     (Stage::Decode, "decode"),
     (Stage::Handle, "handle"),
     (Stage::Encode, "encode"),
     (Stage::Write, "write"),
+    (Stage::Admit, "admit"),
+    (Stage::Queue, "queue"),
 ];
 
 const CLASSES: [&str; 3] = ["produce", "fetch", "other"];
@@ -162,9 +170,34 @@ pub fn record(api_key: i16, stage: Stage, elapsed: Duration) {
     }
 }
 
+/// kr: P13. Requests of a pipelining connection in flight (read, response not written) when
+/// a request is read, this one included: one counter per depth.
+static DEPTH: LazyLock<Vec<AtomicU64>> =
+    LazyLock::new(|| (0..8).map(|_| AtomicU64::new(0)).collect());
+
+pub fn record_depth(in_flight: usize) {
+    if let Some(counter) = DEPTH.get(in_flight.min(7)) {
+        _ = counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// One line per request class seen since the last reset, durations in
-/// microseconds (`p50/p90/p99`).
+/// microseconds (`p50/p90/p99`), then the pipeline depths if any.
 pub fn report() -> Vec<String> {
+    let depths = DEPTH
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    let depth = depths.iter().any(|n| *n > 0).then(|| {
+        let counts = depths
+            .iter()
+            .enumerate()
+            .skip(1)
+            .map(|(d, n)| format!("{d}:{n}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("pipeline depth[{counts}]")
+    });
     CLASSES
         .iter()
         .zip(PROBE.iter())
@@ -183,12 +216,16 @@ pub fn report() -> Vec<String> {
                 format!("{name} n={n} {stages}")
             })
         })
+        .chain(depth)
         .collect()
 }
 
 pub fn reset() {
     for histogram in PROBE.iter().flatten() {
         histogram.reset();
+    }
+    for counter in DEPTH.iter() {
+        counter.store(0, Ordering::Relaxed);
     }
 }
 
