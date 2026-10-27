@@ -460,15 +460,26 @@ where
             }
         }
 
+        // The first refusal stops the chain: a later entry of the same partition is not
+        // staged either (ADR-007 D2), it gets the same code.
         let stage_one = join_all(chains.into_iter().map(|(name, _, chain)| async move {
             let mut out = Vec::with_capacity(chain.len());
+            let mut stopped = None;
             for (i, t, partition) in chain {
-                out.push((
-                    i,
-                    t,
-                    self.partition_staged(transaction_id, &name, partition)
-                        .await,
-                ));
+                let s = match stopped {
+                    Some(code) => StagedPartition {
+                        index: partition.index,
+                        completions: Vec::new(),
+                        refused: None,
+                        early: Some(self.error(partition.index, code)),
+                    },
+                    None => {
+                        self.partition_staged(transaction_id, &name, partition)
+                            .await
+                    }
+                };
+                stopped = stopped.or_else(|| s.stop());
+                out.push((i, t, s));
             }
             out
         }))
@@ -520,6 +531,20 @@ struct StagedPartition {
     refused: Option<ErrorCode>,
     /// Response decided before any batch was staged.
     early: Option<PartitionProduceResponse>,
+}
+
+impl StagedPartition {
+    /// The code that stops the chain of this partition in the request, if any.
+    fn stop(&self) -> Option<ErrorCode> {
+        self.refused.or_else(|| {
+            self.early
+                .as_ref()
+                .filter(|early| early.error_code != i16::from(ErrorCode::None))
+                .map(|early| {
+                    ErrorCode::try_from(early.error_code).unwrap_or(ErrorCode::UnknownServerError)
+                })
+        })
+    }
 }
 
 impl<G, I> Service<I> for ProduceService<G>
@@ -593,22 +618,45 @@ mod kr_p12_tests {
 
     /// A storage whose produce gives `next` offsets per topic partition, in arrival order.
     fn storage() -> RequestChannelService {
+        storage_seen().0
+    }
+
+    /// Records of a batch the storage refuses with `REQUEST_TIMED_OUT` (like `Busy`).
+    const REFUSED_RECORDS: usize = 7;
+
+    /// `storage`, refusing batches of `REFUSED_RECORDS` records, with the record counts of
+    /// the batches it was given, in arrival order.
+    fn storage_seen() -> (RequestChannelService, Arc<std::sync::Mutex<Vec<i32>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (tx, mut rx) = bounded_channel(16);
-        drop(tokio::spawn(async move {
-            let mut next: BTreeMap<Topition, i64> = BTreeMap::new();
-            while let Some((request, reply)) = rx.recv().await {
-                if let Request::Produce {
-                    topition, batch, ..
-                } = request
-                {
-                    let at = next.entry(topition).or_default();
-                    let offset = *at;
-                    *at += i64::from(batch.last_offset_delta) + 1;
-                    _ = reply.send(Response::Produce(Ok(offset)));
+        drop(tokio::spawn({
+            let seen = Arc::clone(&seen);
+            async move {
+                let mut next: BTreeMap<Topition, i64> = BTreeMap::new();
+                while let Some((request, reply)) = rx.recv().await {
+                    if let Request::Produce {
+                        topition, batch, ..
+                    } = request
+                    {
+                        let records = batch.last_offset_delta + 1;
+                        if let Ok(mut seen) = seen.lock() {
+                            seen.push(records);
+                        }
+                        if records == REFUSED_RECORDS as i32 {
+                            _ = reply.send(Response::Produce(Err(Error::Api(
+                                ErrorCode::RequestTimedOut,
+                            ))));
+                            continue;
+                        }
+                        let at = next.entry(topition).or_default();
+                        let offset = *at;
+                        *at += i64::from(records);
+                        _ = reply.send(Response::Produce(Ok(offset)));
+                    }
                 }
             }
         }));
-        RequestChannelService::new(tx)
+        (RequestChannelService::new(tx), seen)
     }
 
     fn batch(value: &'static [u8], records: usize) -> Result<deflated::Batch> {
@@ -725,6 +773,60 @@ mod kr_p12_tests {
         assert_eq!(
             vec![vec![(0, 0, 0), (1, 0, 0), (0, 5, 0)], vec![(0, 9, 0)]],
             offsets
+        );
+        Ok(())
+    }
+
+    /// A refusal stops the partition for the rest of the request: a later entry of the same
+    /// partition is not staged (ADR-007 D2), another partition is.
+    #[tokio::test]
+    async fn a_refusal_stops_the_later_entries_of_the_partition() -> Result<()> {
+        let (extensions, admitted) = admission();
+        let request = ProduceRequest::default().topic_data(Some(vec![
+            topic(
+                "a",
+                vec![
+                    partition(0, vec![batch(b"x", 2)?, batch(b"r", REFUSED_RECORDS)?]),
+                    partition(1, vec![batch(b"z", 1)?]),
+                    partition(0, vec![batch(b"w", 4)?]),
+                ],
+            ),
+            topic("a", vec![partition(0, vec![batch(b"v", 3)?])]),
+        ]));
+        let (storage, seen) = storage_seen();
+        let response = ProduceService { storage }
+            .serve(RequestInput {
+                request,
+                extensions,
+            })
+            .await?;
+        assert_eq!(1, admitted.load(Ordering::SeqCst));
+        let codes = response
+            .responses
+            .iter()
+            .flatten()
+            .map(|t| {
+                t.partition_responses
+                    .iter()
+                    .flatten()
+                    .map(|p| (p.index, p.error_code))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let timed_out = i16::from(ErrorCode::RequestTimedOut);
+        assert_eq!(
+            vec![
+                vec![(0, timed_out), (1, 0), (0, timed_out)],
+                vec![(0, timed_out)]
+            ],
+            codes
+        );
+        let mut seen = seen.lock().map(|s| s.clone()).unwrap_or_default();
+        seen.sort_unstable();
+        assert_eq!(
+            vec![1, 2, REFUSED_RECORDS as i32],
+            seen,
+            "4 and 3 never staged"
         );
         Ok(())
     }
