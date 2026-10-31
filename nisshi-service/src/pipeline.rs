@@ -160,6 +160,10 @@ where
 }
 
 /// The size prefix once its first byte is in: the rest of `TcpBytesService::wait`.
+///
+/// kr: keep in sync with `TcpBytesService::wait` (`stream.rs`): every check added there
+/// after the first prefix byte (frame size, metric, timeout) must be copied here, or the
+/// pipelined connection (depth > 1) silently misses it. Rebase checklist item.
 async fn rest_of_size<R, E>(rd: &mut R, first: u8, limits: ConnectionLimits) -> Result<[u8; 4], E>
 where
     R: AsyncRead + Unpin,

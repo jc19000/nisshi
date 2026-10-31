@@ -744,6 +744,8 @@ where
     S::Error: From<Error> + From<io::Error> + Debug,
 {
     #[instrument(skip_all)]
+    // kr: everything after the first prefix byte is duplicated in `pipeline::rest_of_size`
+    // (P13): keep both in sync.
     pub(crate) async fn wait<R>(
         &self,
         req: &mut R,
