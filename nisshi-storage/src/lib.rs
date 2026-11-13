@@ -1611,6 +1611,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
     async fn advertised_listener(&self) -> Result<Url>;
 
     async fn ping(&self) -> Result<()>;
+
+    /// Replication factor used for CreateTopics `replication_factor = -1` and for the topics
+    /// auto-created by Metadata. The default keeps the upstream behaviour (1).
+    // kr: P15 (ADR-006 amendment D3-RF)
+    fn default_replication_factor(&self) -> i16 {
+        1
+    }
 }
 
 // The existence of this function makes the compiler catch if the Storage
@@ -1905,6 +1912,10 @@ where
     async fn ping(&self) -> Result<()> {
         self.as_ref().ping().await
     }
+
+    fn default_replication_factor(&self) -> i16 {
+        self.as_ref().default_replication_factor()
+    }
 }
 
 #[async_trait]
@@ -2194,6 +2205,10 @@ where
 
     async fn ping(&self) -> Result<()> {
         self.as_ref().ping().await
+    }
+
+    fn default_replication_factor(&self) -> i16 {
+        self.as_ref().default_replication_factor()
     }
 }
 

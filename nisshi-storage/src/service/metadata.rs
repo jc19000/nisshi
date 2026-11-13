@@ -71,7 +71,6 @@ pub struct MetadataService<G> {
 /// Defaults for topics created via auto creation: four partitions is the
 /// `num.partitions` that the Apache Kafka client test suites assume.
 const AUTO_CREATE_NUM_PARTITIONS: i32 = 4;
-const AUTO_CREATE_REPLICATION_FACTOR: i16 = 1;
 
 /// The Apache Kafka topic name rules: 1 to 249 characters from
 /// `[a-zA-Z0-9._-]`, and not "." or "..".
@@ -132,7 +131,8 @@ where
                         CreatableTopic::default()
                             .name(name)
                             .num_partitions(AUTO_CREATE_NUM_PARTITIONS)
-                            .replication_factor(AUTO_CREATE_REPLICATION_FACTOR)
+                            // kr: P15
+                            .replication_factor(self.storage.default_replication_factor())
                             .assignments(Some([].into()))
                             .configs(Some([].into())),
                         false,

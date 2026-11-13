@@ -694,6 +694,11 @@ where
     async fn ping(&self) -> Result<()> {
         self.storage.ping().await
     }
+
+    // kr: P15
+    fn default_replication_factor(&self) -> i16 {
+        self.storage.default_replication_factor()
+    }
 }
 
 #[instrument(skip_all)]
