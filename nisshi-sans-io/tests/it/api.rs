@@ -380,8 +380,40 @@ fn list_offset() -> Result<()> {
     );
     assert_eq!(millis, i64::try_from(offset)?);
 
-    // negative values other than -1 and -2 are errors (can't convert to SystemTime)
-    assert!(ListOffset::try_from(-3i64).is_err());
+    // kr: P16 - the special timestamps of v7 to v9 round-trip
+    for (value, expected) in [
+        (-3i64, ListOffset::MaxTimestamp),
+        (-4, ListOffset::EarliestLocal),
+        (-5, ListOffset::LatestTiered),
+    ] {
+        assert_eq!(expected, ListOffset::try_from(value)?);
+        assert_eq!(value, i64::try_from(expected)?);
+    }
+
+    // any other negative value is kept, never an error
+    for value in [-6i64, -100, i64::MIN] {
+        assert_eq!(ListOffset::Unknown(value), ListOffset::try_from(value)?);
+        assert_eq!(value, i64::try_from(ListOffset::Unknown(value))?);
+    }
+
+    Ok(())
+}
+
+#[test]
+fn list_offset_minimum_versions() -> Result<()> {
+    for (value, minimum) in [(-1i64, 0i16), (-2, 0), (0, 0), (-3, 7), (-4, 8), (-5, 9)] {
+        let offset = ListOffset::try_from(value)?;
+        assert!(offset.is_supported_at(minimum), "{value} at v{minimum}");
+        assert!(offset.is_supported_at(9), "{value} at v9");
+        if minimum > 0 {
+            assert!(
+                !offset.is_supported_at(minimum - 1),
+                "{value} at v{}",
+                minimum - 1
+            );
+        }
+    }
+    assert!(!ListOffset::Unknown(-6).is_supported_at(i16::MAX));
 
     Ok(())
 }

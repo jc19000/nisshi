@@ -22,7 +22,7 @@ use nisshi_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use nisshi_service::{FrameRequestLayer, FrameRouteBuilder};
+use nisshi_service::{FrameApiVersionLayer, FrameRequestLayer, FrameRouteBuilder};
 use nisshi_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
     CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
@@ -451,6 +451,7 @@ where
             ListOffsetsRequest::KEY,
             (
                 MapErrLayer::new(Error::from),
+                FrameApiVersionLayer,
                 FrameRequestLayer::<ListOffsetsRequest>::new(),
             )
                 .into_layer(ListOffsetsService { storage })

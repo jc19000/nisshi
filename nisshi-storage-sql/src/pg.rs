@@ -2695,7 +2695,8 @@ impl Storage for Postgres {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffset::Earliest, _) => "list_earliest_offset.sql",
+                // kr: P16 - no tiered storage: the whole log is local
+                (ListOffset::Earliest | ListOffset::EarliestLocal, _) => "list_earliest_offset.sql",
                 (ListOffset::Latest, IsolationLevel::ReadCommitted) => {
                     "list_latest_offset_committed.sql"
                 }
@@ -2703,12 +2704,24 @@ impl Storage for Postgres {
                     "list_latest_offset_uncommitted.sql"
                 }
                 (ListOffset::Timestamp(_), _) => "list_latest_offset_timestamp.sql",
+                (
+                    ListOffset::MaxTimestamp | ListOffset::LatestTiered | ListOffset::Unknown(_),
+                    _,
+                ) => {
+                    responses.push((topition.clone(), ListOffsetResponse::untiered(*offset_type)));
+                    continue;
+                }
             };
 
             debug!(?query);
 
             let list_offset = match offset_type {
-                ListOffset::Earliest | ListOffset::Latest => self
+                ListOffset::Earliest
+                | ListOffset::EarliestLocal
+                | ListOffset::Latest
+                | ListOffset::MaxTimestamp
+                | ListOffset::LatestTiered
+                | ListOffset::Unknown(_) => self
                     .prepare_query_opt(
                         &c,
                         query,

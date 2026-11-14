@@ -641,6 +641,33 @@ impl ListOffsetResponse {
     pub fn error_code(&self) -> ErrorCode {
         self.error_code
     }
+
+    /// kr: P16. The answer of an engine with neither tiered storage nor a max-timestamp
+    /// lookup, for the specs it does not resolve itself: nothing is tiered (`LatestTiered`
+    /// gives offset -1, as Kafka does for a partition without remote segments);
+    /// `MaxTimestamp` and anything else is `UNSUPPORTED_VERSION` for that partition.
+    /// Such an engine answers `EarliestLocal` as `Earliest`: its whole log is local.
+    pub fn untiered(spec: ListOffset) -> Self {
+        match spec {
+            ListOffset::LatestTiered => Self {
+                error_code: ErrorCode::None,
+                timestamp: None,
+                offset: Some(-1),
+            },
+            _ => Self::unsupported(),
+        }
+    }
+
+    /// kr: P16. A partition whose ListOffsets timestamp is unknown, or too recent for the
+    /// version of the request: `UNSUPPORTED_VERSION` (Kafka 4.0, `ReplicaManager.fetchOffset`).
+    pub fn unsupported() -> Self {
+        Self {
+            error_code: ErrorCode::UnsupportedVersion,
+            timestamp: None,
+            // Kafka's default for an error, rather than the 0 the handler would put
+            offset: Some(-1),
+        }
+    }
 }
 
 /// Offset Commit Request

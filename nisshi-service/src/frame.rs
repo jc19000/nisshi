@@ -22,8 +22,8 @@ use bytes::{BufMut as _, Bytes, BytesMut};
 use nisshi_auth::AuthenticationExtension;
 use nisshi_sans_io::{
     ApiKey, ApiVersionsRequest, Body, BodyInput, BytesInput, Frame, FrameInput, Header,
-    MaximumAllocationSize as _, Request, RequestInput, Response, RootMessageMeta,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    MaximumAllocationSize as _, Request, RequestApiVersion, RequestInput, Response,
+    RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
 };
 use opentelemetry::KeyValue;
 use rama::{Layer, Service, extensions::Extensions, matcher::Matcher, service::BoxService};
@@ -132,6 +132,48 @@ where
     Q: Request,
 {
     const KEY: i16 = Q::KEY;
+}
+
+/// kr: P16. A [`Layer`] putting the version of the request header into the extensions, as
+/// [`RequestApiVersion`], for a handler whose answer depends on it (ListOffsets).
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FrameApiVersionLayer;
+
+impl<S> Layer<S> for FrameApiVersionLayer {
+    type Service = FrameApiVersionService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Self::Service { inner }
+    }
+}
+
+/// kr: P16. See [`FrameApiVersionLayer`].
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FrameApiVersionService<S> {
+    inner: S,
+}
+
+impl<S> Service<FrameInput> for FrameApiVersionService<S>
+where
+    S: Service<FrameInput>,
+    S::Error: From<nisshi_sans_io::Error>,
+{
+    type Output = S::Output;
+    type Error = S::Error;
+
+    async fn serve(&self, req: FrameInput) -> Result<Self::Output, Self::Error> {
+        let version = req.frame.api_version()?;
+        // The extensions are shared by every request of the connection and append-only:
+        // a per-request value goes into a fork, never into the connection's store.
+        let extensions = req.extensions.fork();
+        _ = extensions.insert(RequestApiVersion(version));
+        self.inner
+            .serve(FrameInput {
+                frame: req.frame,
+                extensions,
+            })
+            .await
+    }
 }
 
 /// A [`Layer`] that transforms [`Frame`] into [`Request`]

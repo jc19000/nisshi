@@ -270,9 +270,10 @@ pub use channel::{
 pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
 
 pub use frame::{
-    BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
-    FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameService, RequestApiKeyMatcher,
-    RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
+    BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameApiVersionLayer,
+    FrameApiVersionService, FrameBodyLayer, FrameBytesLayer, FrameBytesService, FrameRequestLayer,
+    FrameService, RequestApiKeyMatcher, RequestFrameLayer, RequestFrameService, RequestLayer,
+    ResponseService,
 };
 
 pub use stream::{

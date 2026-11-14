@@ -18,8 +18,8 @@ use crate::common::{self, StorageType, alphanumeric_string, init_tracing, regist
 use bytes::Bytes;
 use nisshi_broker::{Error, Result, service::storage};
 use nisshi_sans_io::{
-    Ack, CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest,
-    ProduceRequest, RequestInput,
+    Ack, ApiKey as _, CreateTopicsRequest, ErrorCode, Frame, FrameInput, Header, IsolationLevel,
+    ListOffset, ListOffsetsRequest, ListOffsetsResponse, ProduceRequest, RequestInput,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -739,6 +739,139 @@ where
     Ok(())
 }
 
+/// kr: P16 - the special timestamps of v7 to v9 and an unknown negative one in one request:
+/// every partition is answered, the refused ones alone with `UNSUPPORTED_VERSION`. Then, at
+/// v6, -3 is refused for its partition while -1 is served.
+pub async fn special_timestamps<S>(storage: S) -> Result<()>
+where
+    S: Storage + Clone,
+{
+    let topic_name = &alphanumeric_string(15)[..];
+    let num_partitions = 5;
+    let extensions = Extensions::default();
+    let broker = broker(storage.clone())?;
+
+    let response = broker
+        .serve(RequestInput {
+            request: CreateTopicsRequest::default()
+                .timeout_ms(5_000)
+                .validate_only(Some(false))
+                .topics(Some(
+                    [CreatableTopic::default()
+                        .num_partitions(num_partitions)
+                        .configs(Some([].into()))
+                        .assignments(Some([].into()))
+                        .replication_factor(0)
+                        .name(topic_name.into())]
+                    .into(),
+                )),
+            extensions: extensions.clone(),
+        })
+        .await?;
+    assert_eq!(
+        i16::from(ErrorCode::None),
+        response.topics.as_deref().unwrap_or_default()[0].error_code
+    );
+
+    let request = |timestamps: &[i64]| {
+        ListOffsetsRequest::default()
+            .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+            .replica_id(-1)
+            .topics(Some(
+                [ListOffsetsTopic::default()
+                    .name(topic_name.into())
+                    .partitions(Some(
+                        timestamps
+                            .iter()
+                            .enumerate()
+                            .map(|(partition_index, timestamp)| {
+                                ListOffsetsPartition::default()
+                                    .partition_index(partition_index as i32)
+                                    .timestamp(*timestamp)
+                                    .current_leader_epoch(Some(-1))
+                            })
+                            .collect::<Vec<_>>(),
+                    ))]
+                .into(),
+            ))
+    };
+
+    // At the latest version (9), through the whole codec.
+    let response = broker
+        .serve(RequestInput {
+            request: request(&[-1, -3, -4, -5, -6]),
+            extensions: extensions.clone(),
+        })
+        .await?;
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    let mut partitions = topics[0]
+        .partitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| {
+            (
+                p.partition_index,
+                ErrorCode::try_from(p.error_code).ok(),
+                p.offset,
+            )
+        })
+        .collect::<Vec<_>>();
+    partitions.sort_by_key(|(index, _, _)| *index);
+    assert_eq!(
+        vec![
+            // -1 on an empty partition
+            (0, Some(ErrorCode::None), Some(0)),
+            // -3: this engine has no max-timestamp lookup
+            (1, Some(ErrorCode::UnsupportedVersion), Some(-1)),
+            // -4 = earliest: no tiered storage
+            (2, Some(ErrorCode::None), Some(0)),
+            // -5: nothing is tiered
+            (3, Some(ErrorCode::None), Some(-1)),
+            // -6: unknown, refused by the handler
+            (4, Some(ErrorCode::UnsupportedVersion), Some(-1)),
+        ],
+        partitions
+    );
+
+    // At v6, -3 is too recent; the frame goes straight to the routes, at that version.
+    let routes = storage::services(FrameRouteService::<Error>::builder(), storage)?.build()?;
+    let frame = routes
+        .serve(FrameInput {
+            frame: Frame {
+                size: 0,
+                header: Header::Request {
+                    api_key: ListOffsetsRequest::KEY,
+                    api_version: 6,
+                    correlation_id: 0,
+                    client_id: None,
+                },
+                body: request(&[-1, -3]).into(),
+            },
+            extensions: extensions.clone(),
+        })
+        .await?;
+    let response = ListOffsetsResponse::try_from(frame.body)?;
+    let mut partitions = response.topics.as_deref().unwrap_or_default()[0]
+        .partitions
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .map(|p| (p.partition_index, ErrorCode::try_from(p.error_code).ok()))
+        .collect::<Vec<_>>();
+    partitions.sort_by_key(|(index, _)| *index);
+    assert_eq!(
+        vec![
+            (0, Some(ErrorCode::None)),
+            (1, Some(ErrorCode::UnsupportedVersion))
+        ],
+        partitions
+    );
+
+    Ok(())
+}
+
 #[cfg(feature = "postgres")]
 mod pg {
     use super::*;
@@ -834,6 +967,19 @@ mod in_memory {
 
         let broker = broker(sc)?;
         super::multiple_record(broker).await
+    }
+
+    #[tokio::test]
+    async fn special_timestamps() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        let sc = storage_container(cluster_id, broker_id).await?;
+        register_broker(cluster_id, broker_id, &sc).await?;
+
+        super::special_timestamps(sc).await
     }
 
     #[tokio::test]

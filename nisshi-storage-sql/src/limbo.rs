@@ -1987,7 +1987,10 @@ impl Storage for Engine {
 
         for (topition, offset_type) in offsets {
             let query = match (offset_type, isolation_level) {
-                (ListOffsetRequest::Earliest, _) => sql_lookup("list_earliest_offset.sql")?,
+                // kr: P16 - no tiered storage: the whole log is local
+                (ListOffsetRequest::Earliest | ListOffsetRequest::EarliestLocal, _) => {
+                    sql_lookup("list_earliest_offset.sql")?
+                }
                 (ListOffsetRequest::Latest, IsolationLevel::ReadCommitted) => {
                     sql_lookup("list_latest_offset_committed.sql")?
                 }
@@ -1997,12 +2000,26 @@ impl Storage for Engine {
                 (ListOffsetRequest::Timestamp(_), _) => {
                     sql_lookup("list_latest_offset_timestamp.sql")?
                 }
+                (
+                    ListOffsetRequest::MaxTimestamp
+                    | ListOffsetRequest::LatestTiered
+                    | ListOffsetRequest::Unknown(_),
+                    _,
+                ) => {
+                    responses.push((topition.clone(), ListOffsetResponse::untiered(*offset_type)));
+                    continue;
+                }
             };
 
             debug!(?query);
 
             let list_offset = match offset_type {
-                ListOffsetRequest::Earliest | ListOffsetRequest::Latest => self
+                ListOffsetRequest::Earliest
+                | ListOffsetRequest::EarliestLocal
+                | ListOffsetRequest::Latest
+                | ListOffsetRequest::MaxTimestamp
+                | ListOffsetRequest::LatestTiered
+                | ListOffsetRequest::Unknown(_) => self
                     .prepare_query_opt(
                         &c,
                         query.as_str(),

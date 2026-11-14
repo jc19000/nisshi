@@ -1313,7 +1313,8 @@ impl Storage for Engine {
                 })?;
 
             let response = match list_offset {
-                ListOffset::Earliest => {
+                // kr: P16 - no tiered storage: the whole log is local
+                ListOffset::Earliest | ListOffset::EarliestLocal => {
                     // The log start offset is the low watermark, advanced by
                     // delete_records; timestamps below it are pruned there.
                     let offset = watermark.low.unwrap_or(0);
@@ -1377,6 +1378,9 @@ impl Storage for Engine {
                         },
                     }
                 }
+                spec @ (ListOffset::MaxTimestamp
+                | ListOffset::LatestTiered
+                | ListOffset::Unknown(_)) => ListOffsetResponse::untiered(*spec),
             };
 
             responses.push((topition.clone(), response));

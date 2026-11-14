@@ -149,7 +149,9 @@ use std::{
 use tracing::{debug, error, instrument, warn};
 use tracing_subscriber::filter::ParseError;
 
-pub use input::{BodyInput, BytesInput, FrameInput, ProduceAdmission, RequestInput};
+pub use input::{
+    BodyInput, BytesInput, FrameInput, ProduceAdmission, RequestApiVersion, RequestInput,
+};
 
 /// The null topic identifier.
 pub const NULL_TOPIC_ID: [u8; 16] = [0; 16];
@@ -2208,16 +2210,40 @@ pub fn to_timestamp(system_time: &SystemTime) -> Result<i64> {
 ///
 /// An enumeration of offset request types, with conversion from/to an i64 protocol representation.
 ///
+/// kr: P16 - the special timestamps of ListOffsets v7 to v9 (`MaxTimestamp` -3, KIP-734;
+/// `EarliestLocal` -4, KIP-405; `LatestTiered` -5, KIP-1005) and `Unknown` for any other
+/// negative value, so that the conversion never fails on a timestamp: the handler answers
+/// `UNSUPPORTED_VERSION` for that partition alone, as Kafka 4.0 does.
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ListOffset {
     Earliest,
     Latest,
     Timestamp(SystemTime),
+    MaxTimestamp,
+    EarliestLocal,
+    LatestTiered,
+    Unknown(i64),
 }
 
 impl ListOffset {
     const EARLIEST_OFFSET: i64 = -2;
     const LATEST_OFFSET: i64 = -1;
+    const MAX_TIMESTAMP: i64 = -3;
+    const EARLIEST_LOCAL_TIMESTAMP: i64 = -4;
+    const LATEST_TIERED_TIMESTAMP: i64 = -5;
+
+    /// Whether a ListOffsets request of `version` may carry this timestamp: the minimum
+    /// versions of `ReplicaManager.timestampMinSupportedVersion` (Kafka 4.0), except that
+    /// `Earliest` and `Latest` stay accepted at v0, as upstream did. `Unknown` never is.
+    pub fn is_supported_at(&self, version: i16) -> bool {
+        match self {
+            Self::Earliest | Self::Latest | Self::Timestamp(_) => true,
+            Self::MaxTimestamp => version >= 7,
+            Self::EarliestLocal => version >= 8,
+            Self::LatestTiered => version >= 9,
+            Self::Unknown(_) => false,
+        }
+    }
 }
 
 impl TryFrom<ListOffset> for i64 {
@@ -2228,6 +2254,10 @@ impl TryFrom<ListOffset> for i64 {
             ListOffset::Earliest => Ok(ListOffset::EARLIEST_OFFSET),
             ListOffset::Latest => Ok(ListOffset::LATEST_OFFSET),
             ListOffset::Timestamp(timestamp) => to_timestamp(&timestamp),
+            ListOffset::MaxTimestamp => Ok(ListOffset::MAX_TIMESTAMP),
+            ListOffset::EarliestLocal => Ok(ListOffset::EARLIEST_LOCAL_TIMESTAMP),
+            ListOffset::LatestTiered => Ok(ListOffset::LATEST_TIERED_TIMESTAMP),
+            ListOffset::Unknown(value) => Ok(value),
         }
     }
 }
@@ -2239,6 +2269,10 @@ impl TryFrom<i64> for ListOffset {
         match value {
             Self::EARLIEST_OFFSET => Ok(Self::Earliest),
             Self::LATEST_OFFSET => Ok(Self::Latest),
+            Self::MAX_TIMESTAMP => Ok(Self::MaxTimestamp),
+            Self::EARLIEST_LOCAL_TIMESTAMP => Ok(Self::EarliestLocal),
+            Self::LATEST_TIERED_TIMESTAMP => Ok(Self::LatestTiered),
+            negative if negative < 0 => Ok(Self::Unknown(negative)),
             timestamp => to_system_time(timestamp).map(Self::Timestamp),
         }
     }

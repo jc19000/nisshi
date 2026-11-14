@@ -15,13 +15,14 @@
 use std::{collections::BTreeSet, ops::Deref as _};
 
 use nisshi_sans_io::{
-    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, RequestInput,
+    ApiKey, IsolationLevel, ListOffset, ListOffsetsRequest, ListOffsetsResponse, RequestApiVersion,
+    RequestInput,
     list_offsets_response::{ListOffsetsPartitionResponse, ListOffsetsTopicResponse},
 };
 use rama::Service;
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, ListOffsetResponse, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListOffsetsRequest`] returning [`ListOffsetsResponse`].
 /// ```no_run
@@ -119,16 +120,28 @@ where
                 IsolationLevel::try_from(isolation_level)
             })?;
 
+        // kr: P16 - without a frame (direct call), the latest version: no timestamp is gated.
+        let version = input
+            .extensions
+            .get_ref::<RequestApiVersion>()
+            .map_or(i16::MAX, |version| version.0);
+
         let topics = if let Some(topics) = input.request.topics {
             let mut offsets = vec![];
+            let mut refused = vec![];
 
             for topic in topics {
                 if let Some(ref partitions) = topic.partitions {
                     for partition in partitions {
                         let tp = Topition::new(topic.name.clone(), partition.partition_index);
-                        let offset = ListOffset::try_from(partition.timestamp)?;
-
-                        offsets.push((tp, offset));
+                        // kr: P16 - an unknown or too recent timestamp fails its partition
+                        // alone (Kafka 4.0), never the request and its connection.
+                        match ListOffset::try_from(partition.timestamp) {
+                            Ok(offset) if offset.is_supported_at(version) => {
+                                offsets.push((tp, offset))
+                            }
+                            _ => refused.push((tp, ListOffsetResponse::unsupported())),
+                        }
                     }
                 }
             }
@@ -136,8 +149,12 @@ where
             self.storage
                 .list_offsets(isolation_level, offsets.deref())
                 .await
-                .inspect(|r| debug!(?r, ?offsets))
+                .inspect(|r| debug!(?r, ?offsets, ?refused))
                 .inspect_err(|err| error!(?err, ?offsets))
+                .map(|mut offsets| {
+                    offsets.append(&mut refused);
+                    offsets
+                })
                 .map(|offsets| {
                     offsets
                         .iter()

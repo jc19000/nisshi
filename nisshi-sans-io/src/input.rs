@@ -179,3 +179,10 @@ impl std::fmt::Debug for ProduceAdmission {
         f.debug_struct(stringify!(ProduceAdmission)).finish()
     }
 }
+
+/// kr: P16. The version of the request header, put by `FrameApiVersionLayer`
+/// (`nisshi-service`) into a forked copy of the extensions of a request whose handler depends
+/// on it (ListOffsets: minimum version of each special timestamp). Absent when a handler is
+/// called without a frame: the handler then assumes the latest version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Extension)]
+pub struct RequestApiVersion(pub i16);

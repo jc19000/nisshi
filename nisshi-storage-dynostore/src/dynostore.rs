@@ -1246,6 +1246,19 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            // kr: P16 - no tiered storage: the whole log is local
+            let offset_request = &match offset_request {
+                ListOffset::EarliestLocal => ListOffset::Earliest,
+                ListOffset::MaxTimestamp | ListOffset::LatestTiered | ListOffset::Unknown(_) => {
+                    responses.push((
+                        topition.to_owned(),
+                        ListOffsetResponse::untiered(*offset_request),
+                    ));
+                    continue;
+                }
+                other => *other,
+            };
+
             let location = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records",
                 self.cluster, topition.topic, topition.partition,
